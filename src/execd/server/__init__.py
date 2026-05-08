@@ -33,8 +33,6 @@ def main() -> int:
     try:
         server.start()
         # Keep main thread alive
-        import threading
-
         while server._thread and server._thread.is_alive():
             time.sleep(1)
     except KeyboardInterrupt:

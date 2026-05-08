@@ -53,16 +53,19 @@ class Task:
         """Create a Task from dictionary.
 
         Args:
-            data: Dictionary containing task data
+            data: Dictionary containing task data.
 
         Returns:
-            Task instance
+            Task instance.
         """
-        task = cls(data["code"])
-        task.task_id = data.get("task_id", str(uuid.uuid4()))
-        task.status = data.get("status", TaskStatus.PENDING)
-        task.result = data.get("result", "")
-        task.error = data.get("error", "")
-        task.created_at = data.get("created_at", "")
-        task.completed_at = data.get("completed_at", "")
+        code = data.get("code", "")
+        if code is None:
+            code = ""
+        task = cls(code)
+        task.task_id = data.get("task_id") or str(uuid.uuid4())
+        task.status = data.get("status") or TaskStatus.PENDING
+        task.result = data.get("result") or ""
+        task.error = data.get("error") or ""
+        task.created_at = data.get("created_at") or ""
+        task.completed_at = data.get("completed_at") or ""
         return task

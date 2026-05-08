@@ -6,7 +6,7 @@ import http.server
 import json
 import threading
 import time
-from typing import Any  # noqa: F401
+from typing import Any
 
 from execd.core import Task, TaskStatus
 
@@ -22,11 +22,32 @@ class ExecHTTPServer(http.server.HTTPServer):
 
     exec_server: ExecServer | None = None
 
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type,
+        exec_server: ExecServer,
+    ) -> None:
+        """Initialize server with exec_server reference.
+
+        Args:
+            server_address: (host, port) tuple.
+            handler_class: Request handler class.
+            exec_server: The ExecServer instance.
+        """
+        super().__init__(server_address, handler_class)
+        self.exec_server = exec_server
+
 
 class ExecHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for execd server."""
 
-    exec_server: ExecServer | None = None  # noqa: UP045
+    @property
+    def _exec_server(self) -> ExecServer | None:
+        """Get exec_server from server instance."""
+        if isinstance(self.server, ExecHTTPServer):
+            return self.server.exec_server
+        return None
 
     def _set_headers(
         self, status_code: int = 200, content_type: str = "application/json"
@@ -40,16 +61,16 @@ class ExecHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         """Read and parse JSON request body.
 
         Returns:
-            Parsed JSON dictionary
+            Parsed JSON dictionary.
 
         Raises:
-            ValueError: If JSON is invalid
+            ValueError: If JSON is invalid.
         """
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
             return {}
         body = self.rfile.read(content_length).decode("utf-8")
-        return json.loads(body)  # type: ignore[no-any-return]
+        return json.loads(body)  # type: ignore[no-any-return]  # json.loads returns Any
 
     def _send_json_response(self, data: dict[str, Any], status_code: int = 200) -> None:
         """Send JSON response."""
@@ -96,22 +117,24 @@ class ExecHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json_response({"error": "Code cannot be empty"}, 400)
             return
 
-        if self.server.exec_server is None:
+        exec_server = self._exec_server
+        if exec_server is None:
             self._send_json_response({"error": "Server not initialized"}, 500)
             return
 
-        task_id = self.server.exec_server.submit_task(code)
+        task_id = exec_server.submit_task(code)
         self._send_json_response(
             {"task_id": task_id, "status": TaskStatus.PENDING}, 201
         )
 
     def _handle_get_task(self, task_id: str) -> None:
         """Handle GET /tasks/{task_id} - get task status."""
-        if self.server.exec_server is None:
+        exec_server = self._exec_server
+        if exec_server is None:
             self._send_json_response({"error": "Server not initialized"}, 500)
             return
 
-        task = self.server.exec_server.get_task(task_id)
+        task = exec_server.get_task(task_id)
         if task is None:
             self._send_json_response({"error": "Task not found"}, 404)
             return
@@ -120,11 +143,12 @@ class ExecHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_delete_task(self, task_id: str) -> None:
         """Handle DELETE /tasks/{task_id} - cancel/remove task."""
-        if self.server.exec_server is None:
+        exec_server = self._exec_server
+        if exec_server is None:
             self._send_json_response({"error": "Server not initialized"}, 500)
             return
 
-        removed = self.server.exec_server.delete_task(task_id)
+        removed = exec_server.delete_task(task_id)
         if not removed:
             self._send_json_response({"error": "Task not found"}, 404)
             return
@@ -132,7 +156,7 @@ class ExecHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         self._set_headers(204)
         self.wfile.write(b"")
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: ANN401
+    def log_message(self, format: str, *args: object) -> None:  # noqa: ANN401
         """Suppress default logging."""
         pass
 
@@ -144,19 +168,20 @@ class ExecServer:
         """Initialize server.
 
         Args:
-            host: Server host address
-            port: Server port number
+            host: Server host address.
+            port: Server port number.
         """
         self.host = host
         self.port = port
-        self.tasks: dict[str, Task] = {}  # noqa: A003
-        self._server: ExecHTTPServer | None = None  # noqa: UP045
-        self._thread: threading.Thread | None = None  # noqa: UP045
+        self.tasks: dict[str, Task] = {}
+        self._server: ExecHTTPServer | None = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         """Start the HTTP server in a separate thread."""
-        self._server = ExecHTTPServer((self.host, self.port), ExecHTTPRequestHandler)
-        self._server.exec_server = self  # type: ignore[attr-defined]
+        self._server = ExecHTTPServer(
+            (self.host, self.port), ExecHTTPRequestHandler, self
+        )
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -175,10 +200,10 @@ class ExecServer:
         """Submit a task for execution.
 
         Args:
-            code: The code to execute
+            code: The code to execute.
 
         Returns:
-            task_id of the submitted task
+            task_id of the submitted task.
         """
         task = Task(code)
         self.tasks[task.task_id] = task
@@ -191,10 +216,10 @@ class ExecServer:
         """Get task by ID.
 
         Args:
-            task_id: The task ID
+            task_id: The task ID.
 
         Returns:
-            Task if found, None otherwise
+            Task if found, None otherwise.
         """
         return self.tasks.get(task_id)
 
@@ -202,10 +227,10 @@ class ExecServer:
         """Delete a task.
 
         Args:
-            task_id: The task ID
+            task_id: The task ID.
 
         Returns:
-            True if task was deleted, False if not found
+            True if task was deleted, False if not found.
         """
         if task_id in self.tasks:
             del self.tasks[task_id]
@@ -216,7 +241,7 @@ class ExecServer:
         """Execute a task.
 
         Args:
-            task: The task to execute
+            task: The task to execute.
         """
         task.status = TaskStatus.RUNNING
         try:

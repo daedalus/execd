@@ -81,7 +81,7 @@ class ExecClient:
 
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                return json.loads(resp.read().decode("utf-8"))  # type: ignore[no-any-return]  # json.loads returns Any
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 raise TaskNotFound(f"Task not found: {task_id}") from e
@@ -114,7 +114,9 @@ class ExecClient:
                 raise ServerError(f"Server error: {e.code}") from e
             raise
 
-    def wait_for_task(self, task_id: str, timeout: float | None = None) -> dict[str, str | int | bool | None]:
+    def wait_for_task(
+        self, task_id: str, timeout: float | None = None
+    ) -> dict[str, str | int | bool | None]:
         """Wait for a task to complete.
 
         Args:
