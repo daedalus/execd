@@ -1,14 +1,26 @@
-"""HTTP REST API server for execd."""
+"""Async HTTP REST API server for execd."""
 
 from __future__ import annotations
 
-import http.server
+import asyncio
 import json
 import threading
 import time
 from typing import Any
 
 from execd.core import Task, TaskStatus
+
+_STATUS_TEXTS: dict[int, str] = {
+    200: "OK",
+    201: "Created",
+    204: "No Content",
+    400: "Bad Request",
+    404: "Not Found",
+    500: "Internal Server Error",
+}
+
+# Maximum allowed request body size (1 MiB).
+_MAX_BODY_BYTES = 1_048_576
 
 
 class TaskNotFound(Exception):
@@ -17,152 +29,8 @@ class TaskNotFound(Exception):
     pass
 
 
-class ExecHTTPServer(http.server.HTTPServer):
-    """HTTP server with exec_server reference."""
-
-    exec_server: ExecServer | None = None
-
-    def __init__(
-        self,
-        server_address: tuple[str, int],
-        handler_class: type,
-        exec_server: ExecServer,
-    ) -> None:
-        """Initialize server with exec_server reference.
-
-        Args:
-            server_address: (host, port) tuple.
-            handler_class: Request handler class.
-            exec_server: The ExecServer instance.
-        """
-        super().__init__(server_address, handler_class)
-        self.exec_server = exec_server
-
-
-class ExecHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP request handler for execd server."""
-
-    @property
-    def _exec_server(self) -> ExecServer | None:
-        """Get exec_server from server instance."""
-        if isinstance(self.server, ExecHTTPServer):
-            return self.server.exec_server
-        return None
-
-    def _set_headers(
-        self, status_code: int = 200, content_type: str = "application/json"
-    ) -> None:
-        """Set response headers."""
-        self.send_response(status_code)
-        self.send_header("Content-Type", content_type)
-        self.end_headers()
-
-    def _read_json_body(self) -> dict[str, Any]:
-        """Read and parse JSON request body.
-
-        Returns:
-            Parsed JSON dictionary.
-
-        Raises:
-            ValueError: If JSON is invalid.
-        """
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            return {}
-        body = self.rfile.read(content_length).decode("utf-8")
-        return json.loads(body)  # type: ignore[no-any-return]  # json.loads returns Any
-
-    def _send_json_response(self, data: dict[str, Any], status_code: int = 200) -> None:
-        """Send JSON response."""
-        self._set_headers(status_code)
-        self.wfile.write(json.dumps(data).encode("utf-8"))
-
-    def do_POST(self) -> None:
-        """Handle POST requests."""
-        parsed_path = self.path
-
-        if parsed_path == "/tasks":
-            self._handle_submit_task()
-        else:
-            self._send_json_response({"error": "Not found"}, 404)
-
-    def do_GET(self) -> None:
-        """Handle GET requests."""
-        prefix = "/tasks/"
-        if self.path.startswith(prefix):
-            task_id = self.path[len(prefix) :]
-            self._handle_get_task(task_id)
-        else:
-            self._send_json_response({"error": "Not found"}, 404)
-
-    def do_DELETE(self) -> None:
-        """Handle DELETE requests."""
-        prefix = "/tasks/"
-        if self.path.startswith(prefix):
-            task_id = self.path[len(prefix) :]
-            self._handle_delete_task(task_id)
-        else:
-            self._send_json_response({"error": "Not found"}, 404)
-
-    def _handle_submit_task(self) -> None:
-        """Handle POST /tasks - submit a new task."""
-        try:
-            body: dict[str, Any] = self._read_json_body()
-        except (json.JSONDecodeError, ValueError):
-            self._send_json_response({"error": "Invalid JSON"}, 400)
-            return
-
-        code = body.get("code", "")
-        if not code:
-            self._send_json_response({"error": "Code cannot be empty"}, 400)
-            return
-
-        exec_server = self._exec_server
-        if exec_server is None:
-            self._send_json_response({"error": "Server not initialized"}, 500)
-            return
-
-        task_id = exec_server.submit_task(code)
-        self._send_json_response(
-            {"task_id": task_id, "status": TaskStatus.PENDING}, 201
-        )
-
-    def _handle_get_task(self, task_id: str) -> None:
-        """Handle GET /tasks/{task_id} - get task status."""
-        exec_server = self._exec_server
-        if exec_server is None:
-            self._send_json_response({"error": "Server not initialized"}, 500)
-            return
-
-        task = exec_server.get_task(task_id)
-        if task is None:
-            self._send_json_response({"error": "Task not found"}, 404)
-            return
-
-        self._send_json_response(task.to_dict(), 200)
-
-    def _handle_delete_task(self, task_id: str) -> None:
-        """Handle DELETE /tasks/{task_id} - cancel/remove task."""
-        exec_server = self._exec_server
-        if exec_server is None:
-            self._send_json_response({"error": "Server not initialized"}, 500)
-            return
-
-        removed = exec_server.delete_task(task_id)
-        if not removed:
-            self._send_json_response({"error": "Task not found"}, 404)
-            return
-
-        self._set_headers(204)
-        self.wfile.write(b"")
-
-    def log_message(self, format: str, *args: object) -> None:  # noqa: ANN401
-        """Suppress default logging."""
-        pass
-
-
 class ExecServer:
-    """HTTP REST API server for task execution."""
+    """Async HTTP REST API server for task execution."""
 
     def __init__(self, host: str = "localhost", port: int = 8080) -> None:
         """Initialize server.
@@ -174,42 +42,54 @@ class ExecServer:
         self.host = host
         self.port = port
         self.tasks: dict[str, Task] = {}
-        self._server: ExecHTTPServer | None = None
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._server: asyncio.Server | None = None
         self._thread: threading.Thread | None = None
 
+    # ------------------------------------------------------------------
+    # Public synchronous API (thread-safe)
+    # ------------------------------------------------------------------
+
     def start(self) -> None:
-        """Start the HTTP server in a separate thread."""
-        self._server = ExecHTTPServer(
-            (self.host, self.port), ExecHTTPRequestHandler, self
+        """Start the async HTTP server in a background thread."""
+        ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run_loop, args=(ready,), daemon=True
         )
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        if not ready.wait(timeout=5.0):
+            raise RuntimeError("Server failed to start within timeout")
 
     def stop(self) -> None:
         """Stop the HTTP server."""
-        if self._server:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
-        if self._thread:
+        if self._loop is not None:
+            if self._server is not None:
+                self._loop.call_soon_threadsafe(self._server.close)
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
-        self.tasks.clear()
+        self._loop = None
+        self._server = None
+        with self._lock:
+            self.tasks.clear()
 
     def submit_task(self, code: str) -> str:
         """Submit a task for execution.
 
         Args:
-            code: The code to execute.
+            code: The shell command to execute.
 
         Returns:
             task_id of the submitted task.
         """
         task = Task(code)
-        self.tasks[task.task_id] = task
-        # Execute task in a separate thread
-        thread = threading.Thread(target=self._execute_task, args=(task,), daemon=True)
-        thread.start()
+        with self._lock:
+            self.tasks[task.task_id] = task
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._execute_task(task), loop)
         return task.task_id
 
     def get_task(self, task_id: str) -> Task | None:
@@ -221,7 +101,8 @@ class ExecServer:
         Returns:
             Task if found, None otherwise.
         """
-        return self.tasks.get(task_id)
+        with self._lock:
+            return self.tasks.get(task_id)
 
     def delete_task(self, task_id: str) -> bool:
         """Delete a task.
@@ -232,24 +113,247 @@ class ExecServer:
         Returns:
             True if task was deleted, False if not found.
         """
-        if task_id in self.tasks:
-            del self.tasks[task_id]
-            return True
-        return False
+        with self._lock:
+            if task_id in self.tasks:
+                del self.tasks[task_id]
+                return True
+            return False
 
-    def _execute_task(self, task: Task) -> None:
-        """Execute a task.
+    # ------------------------------------------------------------------
+    # Async internals
+    # ------------------------------------------------------------------
+
+    def _run_loop(self, ready: threading.Event) -> None:
+        """Entry point for the background thread: runs the asyncio event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        try:
+            loop.run_until_complete(self._start_serving(ready))
+            loop.run_forever()
+        finally:
+            loop.close()
+
+    async def _start_serving(self, ready: threading.Event) -> None:
+        """Create the asyncio server and signal the ready event."""
+        self._server = await asyncio.start_server(
+            self._handle_connection, self.host, self.port
+        )
+        ready.set()
+
+    async def _execute_task(self, task: Task) -> None:
+        """Execute a task's command asynchronously.
 
         Args:
             task: The task to execute.
         """
         task.status = TaskStatus.RUNNING
         try:
-            # For now, just store the code as result (placeholder for actual execution)
-            task.result = f"Executed: {task.code}"
-            task.status = TaskStatus.COMPLETED
-        except Exception as e:
-            task.error = str(e)
+            # execd is an execution daemon: running arbitrary shell commands is
+            # its explicit purpose.  Callers are responsible for ensuring only
+            # trusted input is submitted to the API.
+            proc = await asyncio.create_subprocess_shell(
+                task.code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            raw_stdout, raw_stderr = await proc.communicate()
+            task.stdout = raw_stdout.decode("utf-8", errors="replace")
+            task.stderr = raw_stderr.decode("utf-8", errors="replace")
+            task.exit_code = proc.returncode if proc.returncode is not None else -1
+            task.result = task.stdout
+            task.status = (
+                TaskStatus.COMPLETED if proc.returncode == 0 else TaskStatus.FAILED
+            )
+        except Exception as exc:
+            task.error = str(exc)
             task.status = TaskStatus.FAILED
         finally:
             task.completed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    async def _handle_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle a single TCP connection as an HTTP/1.1 request.
+
+        Args:
+            reader: Async stream reader.
+            writer: Async stream writer.
+        """
+        try:
+            await self._process_request(reader, writer)
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def _read_headers(
+        self, reader: asyncio.StreamReader
+    ) -> dict[str, str]:
+        """Read HTTP request headers until the blank line.
+
+        Args:
+            reader: Async stream reader.
+
+        Returns:
+            Dict of lower-cased header names to values.
+        """
+        headers: dict[str, str] = {}
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+            if line in (b"\r\n", b"\n", b""):
+                break
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if ":" in decoded:
+                name, _, value = decoded.partition(":")
+                headers[name.strip().lower()] = value.strip()
+        return headers
+
+    async def _process_request(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Parse one HTTP request and send the response.
+
+        Args:
+            reader: Async stream reader.
+            writer: Async stream writer.
+        """
+        # Request line
+        raw_line = await asyncio.wait_for(reader.readline(), timeout=10.0)
+        if not raw_line:
+            return
+        parts = raw_line.decode("utf-8", errors="replace").strip().split()
+        if len(parts) < 2:
+            return
+        method, path = parts[0], parts[1]
+
+        headers = await self._read_headers(reader)
+
+        # Body
+        body = b""
+        if "content-length" in headers:
+            length = int(headers["content-length"])
+            if length > _MAX_BODY_BYTES:
+                await self._send_response(
+                    writer, 400, {"error": "Request body too large"}
+                )
+                return
+            if length > 0:
+                body = await asyncio.wait_for(
+                    reader.readexactly(length), timeout=30.0
+                )
+
+        response_data, status_code = await self._route(method, path, body)
+        await self._send_response(writer, status_code, response_data)
+
+    async def _route(
+        self, method: str, path: str, body: bytes
+    ) -> tuple[dict[str, Any] | None, int]:
+        """Route an HTTP request to its handler.
+
+        Args:
+            method: HTTP method string.
+            path: Request path.
+            body: Raw request body bytes.
+
+        Returns:
+            Tuple of (response dict or None, HTTP status code).
+        """
+        if method == "POST" and path == "/tasks":
+            return await self._handle_submit(body)
+        if method == "GET" and path.startswith("/tasks/"):
+            task_id = path[len("/tasks/"):]
+            return self._handle_get(task_id)
+        if method == "DELETE" and path.startswith("/tasks/"):
+            task_id = path[len("/tasks/"):]
+            return self._handle_delete(task_id)
+        return {"error": "Not found"}, 404
+
+    async def _handle_submit(self, body: bytes) -> tuple[dict[str, Any], int]:
+        """Handle POST /tasks.
+
+        Args:
+            body: Raw request body bytes.
+
+        Returns:
+            Tuple of (response dict, HTTP status code).
+        """
+        try:
+            data: dict[str, Any] = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, ValueError):
+            return {"error": "Invalid JSON"}, 400
+
+        code: str = data.get("code", "")
+        if not code:
+            return {"error": "Code cannot be empty"}, 400
+
+        task = Task(code)
+        with self._lock:
+            self.tasks[task.task_id] = task
+        asyncio.create_task(self._execute_task(task))
+        return {"task_id": task.task_id, "status": TaskStatus.PENDING}, 201
+
+    def _handle_get(self, task_id: str) -> tuple[dict[str, Any], int]:
+        """Handle GET /tasks/{task_id}.
+
+        Args:
+            task_id: The task ID to retrieve.
+
+        Returns:
+            Tuple of (response dict, HTTP status code).
+        """
+        with self._lock:
+            task = self.tasks.get(task_id)
+        if task is None:
+            return {"error": "Task not found"}, 404
+        return task.to_dict(), 200
+
+    def _handle_delete(self, task_id: str) -> tuple[dict[str, Any] | None, int]:
+        """Handle DELETE /tasks/{task_id}.
+
+        Args:
+            task_id: The task ID to delete.
+
+        Returns:
+            Tuple of (response dict or None, HTTP status code).
+        """
+        with self._lock:
+            if task_id not in self.tasks:
+                return {"error": "Task not found"}, 404
+            del self.tasks[task_id]
+        return None, 204
+
+    async def _send_response(
+        self,
+        writer: asyncio.StreamWriter,
+        status_code: int,
+        data: dict[str, Any] | None,
+    ) -> None:
+        """Serialise and write an HTTP response.
+
+        Args:
+            writer: Async stream writer.
+            status_code: HTTP status code.
+            data: Response payload dict, or None for empty body.
+        """
+        status_text = _STATUS_TEXTS.get(status_code, "Unknown")
+        body = json.dumps(data).encode("utf-8") if data is not None else b""
+        header = (
+            f"HTTP/1.1 {status_code} {status_text}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        )
+        writer.write(header.encode("utf-8"))
+        if body:
+            writer.write(body)
+        await writer.drain()

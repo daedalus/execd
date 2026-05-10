@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -26,7 +26,7 @@ def test_client_main_submit(capsys):
     """Test client main function for submit command."""
     from execd.client import main as client_main
 
-    with patch("sys.argv", ["execd-client", "submit", "test code", "--port", "9998"]):
+    with patch("sys.argv", ["execd-client", "submit", "echo hello", "--port", "9998"]):
         with patch("execd.client.ExecClient") as mock_client:
             mock_client_instance = MagicMock()
             mock_client_instance.submit_task.return_value = "test-task-id"
@@ -79,6 +79,54 @@ def test_client_main_no_args():
         assert result == 1
 
 
+def test_client_main_run(capsys):
+    """Test client main function for run (one-shot) command."""
+    from execd.client import main as client_main
+
+    task_result = {
+        "task_id": "test-task-id",
+        "status": "completed",
+        "stdout": "hello world\n",
+        "stderr": "",
+        "exit_code": 0,
+    }
+
+    with patch("sys.argv", ["execd-client", "run", "echo", "hello world", "--port", "9998"]):
+        with patch("execd.client.AsyncExecClient") as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.submit_task = AsyncMock(return_value="test-task-id")
+            mock_instance.wait_for_task = AsyncMock(return_value=task_result)
+            mock_cls.return_value = mock_instance
+            result = client_main()
+            assert result == 0
+            captured = capsys.readouterr()
+            assert "hello world" in captured.out
+
+
+def test_client_main_run_nonzero_exit(capsys):
+    """Test that run command propagates non-zero exit codes."""
+    from execd.client import main as client_main
+
+    task_result = {
+        "task_id": "test-task-id",
+        "status": "failed",
+        "stdout": "",
+        "stderr": "error\n",
+        "exit_code": 1,
+    }
+
+    with patch("sys.argv", ["execd-client", "run", "false", "--port", "9998"]):
+        with patch("execd.client.AsyncExecClient") as mock_cls:
+            mock_instance = MagicMock()
+            mock_instance.submit_task = AsyncMock(return_value="test-task-id")
+            mock_instance.wait_for_task = AsyncMock(return_value=task_result)
+            mock_cls.return_value = mock_instance
+            result = client_main()
+            assert result == 1
+            captured = capsys.readouterr()
+            assert "error" in captured.err
+
+
 def test_main_entry_point_server():
     """Test __main__.py entry point for server."""
     import execd.__main__ as main_module
@@ -88,7 +136,6 @@ def test_main_entry_point_server():
         with patch("execd.server.main") as mock_server_main:
             mock_server_main.return_value = 0
             result = main_module.main() if hasattr(main_module, "main") else 0
-            # The __main__.py should call server_main
             assert result == 0 or mock_server_main.called
 
 
@@ -96,8 +143,7 @@ def test_main_entry_point_client_submit():
     """Test __main__.py entry point for client submit."""
     import execd.__main__ as main_module
 
-    with patch("sys.argv", ["execd", "client", "submit", "test"]):
+    with patch("sys.argv", ["execd", "client", "submit", "echo test"]):
         with patch("execd.client.main") as mock_client_main:
             mock_client_main.return_value = 0
-            # Just verify it doesn't crash
             pass

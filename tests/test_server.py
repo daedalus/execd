@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 
 import pytest
@@ -21,10 +20,10 @@ def test_server_init():
 
 def test_server_submit_task(server):
     """Test submitting a task to the server."""
-    task_id = server.submit_task("print('hello')")
+    task_id = server.submit_task("echo hello")
     assert task_id in server.tasks
     task = server.tasks[task_id]
-    assert task.code == "print('hello')"
+    assert task.code == "echo hello"
 
     # Wait for task to complete
     time.sleep(1)
@@ -33,13 +32,13 @@ def test_server_submit_task(server):
 
 def test_server_get_task(server):
     """Test getting a task from the server."""
-    task_id = server.submit_task("test code")
+    task_id = server.submit_task("true")
     time.sleep(1)
 
     task = server.get_task(task_id)
     assert task is not None
     assert task.task_id == task_id
-    assert task.code == "test code"
+    assert task.code == "true"
 
 
 def test_server_get_nonexistent_task(server):
@@ -50,7 +49,7 @@ def test_server_get_nonexistent_task(server):
 
 def test_server_delete_task(server):
     """Test deleting a task from the server."""
-    task_id = server.submit_task("test code")
+    task_id = server.submit_task("true")
     assert task_id in server.tasks
 
     removed = server.delete_task(task_id)
@@ -66,16 +65,22 @@ def test_server_delete_nonexistent_task(server):
 
 def test_task_model():
     """Test Task model creation and serialization."""
-    task = Task("test code")
-    assert task.code == "test code"
+    task = Task("true")
+    assert task.code == "true"
     assert task.status == TaskStatus.PENDING
     assert task.result == ""
     assert task.error == ""
+    assert task.stdout == ""
+    assert task.stderr == ""
+    assert task.exit_code is None
 
     task_dict = task.to_dict()
     assert "task_id" in task_dict
-    assert task_dict["code"] == "test code"
+    assert task_dict["code"] == "true"
     assert task_dict["status"] == TaskStatus.PENDING
+    assert task_dict["stdout"] == ""
+    assert task_dict["stderr"] == ""
+    assert task_dict["exit_code"] is None
 
 
 def test_task_model_from_dict():
@@ -83,9 +88,12 @@ def test_task_model_from_dict():
     data = {
         "task_id": "test-id",
         "status": TaskStatus.COMPLETED,
-        "code": "test code",
-        "result": "some result",
+        "code": "echo hello",
+        "result": "hello\n",
         "error": "",
+        "stdout": "hello\n",
+        "stderr": "",
+        "exit_code": 0,
         "created_at": "2026-05-07T12:00:00Z",
         "completed_at": "2026-05-07T12:00:01Z",
     }
@@ -93,7 +101,32 @@ def test_task_model_from_dict():
     task = Task.from_dict(data)
     assert task.task_id == "test-id"
     assert task.status == TaskStatus.COMPLETED
-    assert task.result == "some result"
+    assert task.result == "hello\n"
+    assert task.stdout == "hello\n"
+    assert task.exit_code == 0
+
+
+def test_server_task_stdout_stderr(server):
+    """Test that stdout and stderr are captured correctly."""
+    task_id = server.submit_task("echo hello")
+    time.sleep(1)
+
+    task = server.get_task(task_id)
+    assert task is not None
+    assert task.status == TaskStatus.COMPLETED
+    assert "hello" in task.stdout
+    assert task.exit_code == 0
+
+
+def test_server_task_failed(server):
+    """Test that a failing command sets status to FAILED."""
+    task_id = server.submit_task("false")
+    time.sleep(1)
+
+    task = server.get_task(task_id)
+    assert task is not None
+    assert task.status == TaskStatus.FAILED
+    assert task.exit_code != 0
 
 
 def test_server_stop():
@@ -113,9 +146,9 @@ def test_server_submit_and_get():
     server.start()
     time.sleep(0.5)
 
-    task_id = server.submit_task("test code")
+    task_id = server.submit_task("true")
     task = server.get_task(task_id)
     assert task is not None
-    assert task.code == "test code"
+    assert task.code == "true"
 
     server.stop()
