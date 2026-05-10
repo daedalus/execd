@@ -113,6 +113,8 @@ def test_client_task_stderr_captured(server, client):
     """Test that stderr output is captured in the task."""
     task_id = client.submit_task("echo error_msg >&2")
     task = client.wait_for_task(task_id)
+    assert task["status"] == TaskStatus.COMPLETED
+    assert task["exit_code"] == 0
     assert "error_msg" in task["stderr"]
 
 

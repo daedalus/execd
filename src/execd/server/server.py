@@ -19,6 +19,9 @@ _STATUS_TEXTS: dict[int, str] = {
     500: "Internal Server Error",
 }
 
+# Maximum allowed request body size (1 MiB).
+_MAX_BODY_BYTES = 1_048_576
+
 
 class TaskNotFound(Exception):
     """Raised when a task is not found."""
@@ -146,6 +149,9 @@ class ExecServer:
         """
         task.status = TaskStatus.RUNNING
         try:
+            # execd is an execution daemon: running arbitrary shell commands is
+            # its explicit purpose.  Callers are responsible for ensuring only
+            # trusted input is submitted to the API.
             proc = await asyncio.create_subprocess_shell(
                 task.code,
                 stdout=asyncio.subprocess.PIPE,
@@ -235,6 +241,11 @@ class ExecServer:
         body = b""
         if "content-length" in headers:
             length = int(headers["content-length"])
+            if length > _MAX_BODY_BYTES:
+                await self._send_response(
+                    writer, 400, {"error": "Request body too large"}
+                )
+                return
             if length > 0:
                 body = await asyncio.wait_for(
                     reader.readexactly(length), timeout=30.0
